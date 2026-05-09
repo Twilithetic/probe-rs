@@ -1,7 +1,7 @@
 # probe-rs CLI 参数解析全流程
-## 十四、Flash 布局可视化 — `--flash-layout-output-path`
+
 > 从终端字符串到 Rust 结构体的每一步
-`flash_layout` 变量初始为 `None`，在烧录过程中被 daemon 的进度事件偷偷填上，最后用来画图：
+
 ## 一、完整调用链
 ```
 用户敲: probe-rs download --chip CYT2BL3BAS --speed 100 build/firmware.elf
@@ -383,3 +383,84 @@ pub fn sanitize(&mut self) {
 | `algo1,, algo2` | `algo1` `algo2`（空串被移除） |
 没传 `--prefer-flash-algorithm` 时该字段为空 vec，`sanitize()` 直接跳过。
 | `util/common_options.rs` | 89-138 | `ProbeOptions` (探针配置) |
+
+## 十四、Flash 布局可视化 — `--flash-layout-output-path`
+
+`flash_layout` 变量初始为 `None`，在烧录过程中被 daemon 的进度事件偷偷填上，最后用来画图：
+
+```rust
+let mut flash_layout = None;   // 初始空着
+
+session.flash(..., async |event| {
+    if let ProgressEvent::FlashLayoutReady { flash_layout: layout } = &event {
+        flash_layout = Some(layout.clone());  // ← 回调里偷偷填
+    }
+}).await?;
+
+if let Some(path) = download_options.flash_layout_output_path {
+    let visualizer = flash_layout.visualize();
+    visualizer.write_svg(path)?;
+}
+```
+
+用法: `probe-rs download --flash-layout-output-path flash.svg build/firmware.elf`
+
+### 生成 SVG 的完整流程
+
+```rust
+// 烧录结束后
+if let Some(path) = download_options.flash_layout_output_path
+    && let Some(phases) = flash_layout       // ← 来自前面 flash 回调
+{
+    let mut merged = FlashLayout::default();
+    for phase in phases {
+        merged.merge_from(phase);            // 合并多阶段布局
+    }
+    let visualizer = merged.visualize();     // 生成可视化
+    _ = visualizer.write_svg(path);          // 输出 SVG
+}
+```
+
+SVG 里能看到: 每个 Sector 的擦除状态、每个 Page 的写入数据量、Fill 操作范围。
+
+## 十五、`--preverify` — 烧录前预校验，相同固件自动跳过
+
+```rust
+let run_flash = if download_options.preverify {
+    // 先读 Flash，和 ELF 对比
+    let result = session.verify(loader.loader, ...).await?;
+
+    // 芯片已有相同数据 → 跳过烧录；不同 → 正常烧
+    result == VerifyResult::Mismatch
+} else {
+    true  // 没开 preverify，直接烧
+};
+```
+
+| 芯片 Flash 状态 | preverify 结果 | 行为 |
+|--------------|:--:|------|
+| 空的 / 旧固件 | `Mismatch` | 正常烧录 |
+| 已经是这个固件 | `Match` | **跳过！0 秒完成** |
+| 没开 `--preverify` | — | 正常烧录 |
+
+用法: `probe-rs download --preverify build/firmware.elf`
+
+反复烧同一个固件时，第二次起直接跳过。
+
+## 十六、`session.verify()` vs `session.flash()` — 烧录核心分水岭
+
+```rust
+// PREverify: 只读不写 — 看看芯片里有什么
+session.verify(loader.loader, ...)  // 读回 Flash 比对，不擦不写
+
+// FLASH: 真正烧录 — 擦除 + 编程 + 校验
+session.flash(options, loader.loader, ...)  // 擦 Sector + 写 Page + 验证
+```
+
+| | `verify()` | `flash()` |
+|--|-----------|----------|
+| 擦除 Flash | ❌ | ✅ |
+| 编程 Flash | ❌ | ✅ |
+| 干什么 | 只读回比对 | 擦 + 写 + 验 |
+| 触发条件 | `--preverify` | `run_flash == true` |
+
